@@ -1,0 +1,203 @@
+version: '3.7'
+services:
+
+  pd:
+    image: pingcap/pd:latest
+    ports:
+      - "2379"
+    volumes:
+      - ./config/tidb-config/pd.toml:/pd.toml:ro
+      - ./logs/tidbs:/logs/
+    command:
+      - --name=pd
+      - --client-urls=http://0.0.0.0:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-client-urls=http://pd:2379
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd=http://pd:2380
+      - --data-dir=/data/pd
+      - --config=/pd.toml
+      - --log-file=/logs/pd.log
+    restart: on-failure
+
+  tikv:
+    image: pingcap/tikv:latest
+    volumes:
+      - ./config/tidb-config/tikv.toml:/tikv.toml:ro
+      - ./logs/tidbs:/logs/
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
+      - --data-dir=/data/tikv
+      - --pd=pd:2379
+      - --config=/tikv.toml
+      - --log-file=/logs/tikv.log
+    depends_on:
+      - "pd"
+    restart: on-failure
+
+
+  tidb:
+    image: pingcap/tidb:latest
+    ports:
+      - "4000:4000"
+      - "12080:12080"
+    volumes:
+      - ./config/tidb-config/tidb.toml:/tidb.toml:ro
+      - ./logs/tidbs:/logs/
+    command:
+      - --store=tikv
+      - --path=pd:2379
+      - --config=/tidb.toml
+      - --log-file=/logs/tidb.log
+      - --log-slow-query=/logs/tidb_slow.log
+      - --advertise-address=tidb
+      - --status=12080
+    depends_on:
+      - "tikv"
+    restart: on-failure
+
+
+
+  jobmanager:
+    image: flink:1.12.2-scala_2.12
+    volumes:
+      - ./logs/jobmanager/:/opt/flink/log/
+      - ./flink-jars/:/opt/flink/connector-lib/
+      - ./logs/flink-checkpoints/:/flink-checkpoints
+    hostname: "jobmanager"
+    expose:
+      - "6123"
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///flink-checkpoints
+  taskmanager:
+    image: flink:1.12.2-scala_2.12
+    volumes:
+      - ./logs/taskmanager/:/opt/flink/log/
+      - ./logs/flink-checkpoints/:/flink-checkpoints
+    expose:
+      - "6121"
+      - "6122"
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    links:
+      - jobmanager:jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 8
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///flink-checkpoints
+
+
+
+  zookeeper:
+    image: zookeeper:3.6.1
+    ports:
+      - "2181:2181"
+
+  hdfs:
+    image: pravega/hdfs:2.7.7
+    ports:
+      - "2222:2222"
+      - "8020:8020"
+      - "50090:50090"
+      - "50010:50010"
+      - "50020:50020"
+      - "50075:50075"
+      - "50070:50070"
+    environment:
+      SSH_PORT: 2222
+      HDFS_HOST: ${HOST_IP}
+
+  bookie1:
+    image: pravega/bookkeeper
+    ports:
+      - "3181:3181"
+    restart: always
+    environment:
+      ZK_URL: zookeeper:2181
+      bookiePort: 3181
+    links:
+      - zookeeper
+
+  bookie2:
+      image: pravega/bookkeeper
+      ports:
+        - "3182:3182"
+      restart: always
+      environment:
+        ZK_URL: zookeeper:2181
+        bookiePort: 3182
+      links:
+        - zookeeper
+
+  bookie3:
+      image: pravega/bookkeeper
+      ports:
+        - "3183:3183"
+      restart: always
+      environment:
+        ZK_URL: zookeeper:2181
+        bookiePort: 3183
+      links:
+        - zookeeper
+
+  controller:
+    image: pravega/pravega
+    ports:
+      - "9090:9090"
+      - "10080:10080"
+    command: controller
+    environment:
+      WAIT_FOR: zookeeper:2181
+      ZK_URL: zookeeper:2181
+      REST_SERVER_PORT: 10080
+      JAVA_OPTS: |
+        -Dcontroller.service.rpc.listener.port=9090
+        -Xmx512m
+        -XX:OnError="kill -9 p%"
+        -XX:+ExitOnOutOfMemoryError
+        -XX:+CrashOnOutOfMemoryError
+        -XX:+HeapDumpOnOutOfMemoryError
+      SERVICE_HOST_IP: segmentstore
+    links:
+      - zookeeper
+
+  segmentstore:
+    image: pravega/pravega
+    ports:
+      - "12345:12345"
+    command: segmentstore
+    environment:
+      WAIT_FOR: bookie1:3181,bookie2:3182,bookie3:3183,hdfs:8020
+      TIER2_STORAGE: "HDFS"
+      HDFS_REPLICATION: 1
+      HDFS_URL: ${HOST_IP}:8020
+      ZK_URL: zookeeper:2181
+      CONTROLLER_URL: tcp://${HOST_IP}:9090
+      JAVA_OPTS: |
+        -Dpravegaservice.service.published.host.nameOrIp=${HOST_IP}
+        -Dbookkeeper.ensemble.size=2
+        -Dbookkeeper.ack.quorum.size=2
+        -Dbookkeeper.write.quorum.size=2
+        -Xmx900m
+        -XX:OnError="kill -9 p%"
+        -XX:+ExitOnOutOfMemoryError
+        -XX:+CrashOnOutOfMemoryError
+        -XX:+HeapDumpOnOutOfMemoryError
+    links:
+      - zookeeper
+      - hdfs
+      - bookie1
+      - bookie2
+      - bookie3
